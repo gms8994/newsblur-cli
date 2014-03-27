@@ -2,7 +2,6 @@
 
 use strict;
 use Curses::UI;
-use Data::Dumper;
 use Time::HiRes qw(gettimeofday);
 
 my $cui = new Curses::UI(
@@ -13,6 +12,7 @@ $cui->leave_curses();
 
 my $nb = Newsblur->new();
 $nb->set_cui($cui);
+
 my %subscriptions = $nb->get_subscriptions();
 my %stories;
 my @story_hashes = ();
@@ -32,13 +32,21 @@ $cui->add_callback('story_container', sub {
 
 	if (((gettimeofday() - 10) > $last_sync_attempt)
 		&& (scalar(@story_hashes) > 0)) {
-		$last_sync_attempt = gettimeofday();
 
-		my $result = $nb->mark_as_read(\@story_hashes);
-		@story_hashes = () if ($result);
+		attempt_sync();
 	}
 });
 $cui->mainloop();
+
+sub attempt_sync() {
+	$last_sync_attempt = gettimeofday();
+
+	my $result = $nb->mark_as_read(\@story_hashes);
+	@story_hashes = () if ($result);
+	$cui->status("Counting is hard");
+	$nb->refresh_feeds();
+	$cui->nostatus();
+}
 
 sub draw_posts_window() {
 	my ($widget) = @_;
@@ -46,21 +54,27 @@ sub draw_posts_window() {
 	my $feed_id = $widget->get();
 
 	%stories = $nb->get_stories($feed_id);
-	$story_list->title("Unread stories for " . $subscriptions{$feed_id});
+	my $title = $subscriptions{$feed_id};
+	$title =~ s/<\/?bold>//g;
+	$story_list->title("Unread stories for " . $title);
 
+	$story_container->text('');
+	$story_container->title('');
+	$story_container->draw();
+
+	update_stories();
+	$story_list->focus();
+}
+
+sub update_stories() {
 	my %labels = ();
 	foreach my $story (keys %stories) {
 		$labels{$story} = $stories{$story}{'title'};
 	}
 	
-	$story_container->text('');
-	$story_container->title('');
-	$story_container->draw();
-
 	$story_list->labels(\%labels);
 	$story_list->values( [ keys(%stories) ] );
 	$story_list->draw();
-	$story_list->focus();
 }
 
 sub display_content() {
@@ -69,10 +83,15 @@ sub display_content() {
 	my $story_id = $widget->get();
 	push(@story_hashes, $story_id);
 
+	$stories{$story_id}{title} =~ s/<\/?bold>//g;
+	update_stories();
+	$story_list->set_selection($story_id);
+
 	my $content = $stories{$story_id}{content};
-	eval {
+	eval "use HTML::Restrict;";
+
+	if (! $@) {
 		use HTML::Entities;
-		use HTML::Restrict;
 
 		my $hs = HTML::Restrict->new(
 			trim			=> 0,
@@ -82,12 +101,13 @@ sub display_content() {
 			},
 			rules			=> {
 				p   => [],
+				h1   => [],
 			}
 		);
 		$content = $hs->process( $stories{$story_id}{content} );
-		$content =~ s/<p>//g;
-		$content =~ s/<\/p>/\n\n/g;
-		$content =~ s/(\n\n)+/\n\n/g;
+		$content =~ s/<\/?p>/\n\n/g;
+		$content =~ s/<(\/)?h1>/<$1bold>/g;
+		1 while $content =~ s/(\n\n)+/\n\n/g;
 		$content = decode_entities($content);
 	};
 
@@ -109,7 +129,30 @@ sub set_menu() {
 	my $menu = $cui->add( 'menu','Menubar', -menu => \@menu, -fg  => "blue" );
 
 	$cui->set_binding(sub {$menu->focus()}, "\cX");
-	$cui->set_binding( \&exit_dialog , "\cQ");
+	$cui->set_binding( \&exit_dialog , "\cQ" );
+	$cui->set_binding( \&update_subscriptions, "\cR" );
+	$cui->set_binding(sub {
+		eval "use Browser::Open qw( open_browser );";
+
+		if ($@) {
+			$cui->status("You need to install the Browser::Open perl module to use this functionality");
+		} else {
+			my $url = $story_container->title();
+
+			open_browser($url);
+		};
+	}, "o");
+}
+
+sub update_subscriptions() {
+
+	attempt_sync();
+
+	my %subscriptions = $nb->get_subscriptions();
+
+	$sub_list->values([ keys(%subscriptions) ]);
+	$sub_list->labels(\%subscriptions);
+	$sub_list->draw();
 }
 
 sub set_window() {
@@ -152,6 +195,10 @@ sub status() {
 	$cui->status($status . " ...");
 }
 
+sub sub_list() {
+	return $sub_list;
+}
+
 sub exit_dialog() {
 	my $return = $cui->dialog(
 		-message   => "Do you really want to quit?",
@@ -164,7 +211,6 @@ sub exit_dialog() {
 
 package Newsblur;
 
-use Data::Dumper;
 use JSON;
 use LWP::UserAgent;
 use URI;
@@ -179,7 +225,7 @@ sub new() {
 	$self->{'_base_url'} = 'https://www.newsblur.com';
 
 	my $ua = LWP::UserAgent->new();
-	$ua->cookie_jar({ file => "$ENV{HOME}/.cookies.txt" });
+	$ua->cookie_jar({ file => "$ENV{HOME}/.cookies.txt", autosave => 1 });
 	$ua->timeout(10);
 	$ua->env_proxy;
 	$self->{'ua'} = $ua;
@@ -204,11 +250,18 @@ sub get_subscriptions() {
 
 	$self->status("Getting feeds");
 	my $result = decode_json($self->get('/reader/feeds', { }));
+	$self->nostatus();
+
+	$self->status("Counting is hard");
+	my $counts = decode_json($self->get('/reader/refresh_feeds'));
+	$self->nostatus();
 
 	my %subscriptions = ();
 	foreach my $feed_id (keys %{$result->{feeds}}) {
-		next unless $result->{feeds}{$feed_id}{nt} > 0; # new topics maybe?
-		$subscriptions{$feed_id} = $result->{feeds}{$feed_id}{feed_title};
+		next unless
+			$counts->{feeds}{$feed_id}{nt} > 0 # neutral intelligence
+			|| $counts->{feeds}{$feed_id}{ps} > 0; # positive intelligence
+		$subscriptions{$feed_id} = '<bold>' . $result->{feeds}{$feed_id}{feed_title} . '</bold>';
 	}
 	
 	return %subscriptions;
@@ -218,6 +271,15 @@ sub mark_as_read() {
 	my ($self, $hashes) = @_;
 
 	my $result = decode_json($self->post('/reader/mark_story_hashes_as_read', { story_hash => $hashes }));
+
+	return 1 if ($result->{result} eq 'ok');
+	return 0;
+}
+
+sub refresh_feeds() {
+	my ($self, $hashes) = @_;
+
+	my $result = decode_json($self->get('/reader/refresh_feeds'));
 
 	return 1 if ($result->{result} eq 'ok');
 	return 0;
@@ -234,11 +296,12 @@ sub get_stories() {
 
 	$self->status("Getting stories for feed");
 	my $result = decode_json($self->get('/reader/feed/' . $feed_id, { read_filter => 'unread' }));
+	$self->nostatus();
 
 	my %stories = ();
 	foreach my $story (@{$result->{stories}}) {
 		$stories{$story->{story_hash}} = {
-			title => $story->{story_title},
+			title => '<bold>' . $story->{story_title} . '</bold>',
 			content => $story->{story_content},
 			link => $story->{story_permalink}
 		};
@@ -252,7 +315,7 @@ sub get() {
 	my $ua = $self->{ua};
 	my $url = URI->new($self->{_base_url});
 	$url->path($endpoint);
-	$url->query_form_hash($parameters);
+	$url->query_form_hash($parameters) if $parameters;
 
 	my $response = $ua->get($url);
 
@@ -280,6 +343,14 @@ sub post() {
 sub is_logged_in() {
 	my ($self) = @_;
 
+	if (! $self->{_logged_in}) {
+		my @cookies = grep { /newsblur.com/ } split /\n/, $self->{ua}->cookie_jar()->as_string;
+
+		if (scalar(@cookies) == 1) {
+			$self->{_logged_in} = 1;
+		}
+	}
+
 	return $self->{_logged_in} if ($self->{_logged_in});
 	return 0;
 }
@@ -288,10 +359,20 @@ sub login() {
 	my ($self) = @_;
 
 	my $username = $self->{cui}->question("What is your Newsblur.com username?");
-	my $password = $self->{cui}->question("What is your Newsblur.com password?");
+
+	## This here is the crazyness that has to happen to get a password based question box with Curses::UI
+    my $id = "__window_Dialog::Question";
+    my $dialog = $self->{cui}->add($id, 'Dialog::Question', -question => "What is your newsblur.com password?", -password => '*');
+	my $te = $dialog->getobj('answer');
+	$te->{-password} = '*';
+    $dialog->modalfocus;
+    my $password = $dialog->get;
+    $self->{cui}->delete($id);
+    $self->{cui}->root->focus(undef, 1);
 
 	$self->status("Attempting to log in");
 	my $result = decode_json($self->post('/api/login', { username => $username, password => $password }));
+	$self->nostatus();
 
 	if ($result->{errors}) {
 		$self->error($result->{errors});
@@ -299,12 +380,19 @@ sub login() {
 
 	$self->status("Logged in successfully!");
 	$self->{_logged_in} = 1;
+	$self->nostatus();
 }
 
 sub status() {
 	my ($self, $status) = @_;
 
 	$self->{cui}->status($status . " ...");
+}
+
+sub nostatus() {
+	my ($self) = @_;
+
+	$self->{cui}->nostatus();
 }
 
 sub error() {
