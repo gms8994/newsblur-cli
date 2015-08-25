@@ -2,6 +2,7 @@
 
 use strict;
 use Curses::UI;
+use Text::Unidecode;
 use Time::HiRes qw(gettimeofday);
 
 my $cui = new Curses::UI(
@@ -20,6 +21,7 @@ my $last_sync_attempt = gettimeofday();
 
 my $sub_list_width = 30;
 my $story_list_height = 10;
+my $selected_story = undef;
 
 my ($mainwindow, $sub_list, $story_list, $story_container);
 
@@ -27,28 +29,20 @@ set_menu();
 set_window();
 
 $sub_list->focus();
-$cui->add_callback('story_container', sub {
-	my ($widget) = @_;
-
-	if (((gettimeofday() - 10) > $last_sync_attempt)
-		&& (scalar(@story_hashes) > 0)) {
-
-		attempt_sync();
-	}
-});
 $cui->mainloop();
 
-sub attempt_sync() {
+sub attempt_sync {
+	my ($message) = @_;
 	$last_sync_attempt = gettimeofday();
 
 	my $result = $nb->mark_as_read(\@story_hashes);
 	@story_hashes = () if ($result);
-	$cui->status("Counting is hard");
-	$nb->refresh_feeds();
-	$cui->nostatus();
+	status("Counting is hard: $message", sub {
+		$nb->refresh_feeds();
+	});
 }
 
-sub draw_posts_window() {
+sub draw_posts_window {
 	my ($widget) = @_;
 
 	my $feed_id = $widget->get();
@@ -66,7 +60,7 @@ sub draw_posts_window() {
 	$story_list->focus();
 }
 
-sub update_stories() {
+sub update_stories {
 	my %labels = ();
 	foreach my $story (keys %stories) {
 		$labels{$story} = $stories{$story}{'title'};
@@ -77,7 +71,7 @@ sub update_stories() {
 	$story_list->draw();
 }
 
-sub display_content() {
+sub display_content {
 	my ($widget) = @_;
 
 	my $story_id = $widget->get();
@@ -85,31 +79,25 @@ sub display_content() {
 
 	$stories{$story_id}{title} =~ s/<\/?bold>//g;
 	update_stories();
+	$selected_story = $story_id;
 	$story_list->set_selection($story_id);
 
-	my $content = $stories{$story_id}{content};
-	eval "use HTML::Restrict;";
+	my $content = unidecode($stories{$story_id}{content});
+	eval "use HTML::WikiConverter;";
 
-	if (! $@) {
-		use HTML::Entities;
+	my $_does_not_have_converter = $@;
 
-		my $hs = HTML::Restrict->new(
-			trim			=> 0,
-			replace_image	=> sub {
-				my ($tagname, $attr, $text) = @_; # from HTML::Parser
-				return qq{ (IMAGE: $attr->{alt} )};
-			},
-			rules			=> {
-				p   => [],
-				h1   => [],
-			}
-		);
-		$content = $hs->process( $stories{$story_id}{content} );
-		$content =~ s/<\/?p>/\n\n/g;
-		$content =~ s/<(\/)?h1>/<$1bold>/g;
-		1 while $content =~ s/(\n\n)+/\n\n/g;
-		$content = decode_entities($content);
-	};
+	if (! $_does_not_have_converter) {
+		eval "use HTML::WikiConverter::Markdown;";
+		if (! $@) {
+			my $wc = new HTML::WikiConverter(
+				dialect => 'Markdown',
+				header_style => 'setext',
+				link_style => 'inline'
+			);
+			$content = $wc->html2wiki( $content );
+		}
+	}
 
 	$story_list->height(scalar(keys(%stories)));
 	$story_list->draw();
@@ -121,13 +109,20 @@ sub display_content() {
 	$story_container->cursor_to_home();
 	$story_container->draw();
 
+	if ($_does_not_have_converter) {
+		$cui->status("This would be more readable if you installed the HTML::WikiConverter::Markdown perl module");
+		sleep 5;
+		$cui->nostatus;
+	}
+
 	$story_container->focus() if (length($content) > $max_chars);
 }
 
-sub set_menu() {
+sub set_menu {
 	my @menu = ( { -label => 'File', -submenu => [ { -label => 'Exit      ^Q', -value => \&exit_dialog } ] } );
 	my $menu = $cui->add( 'menu','Menubar', -menu => \@menu, -fg  => "blue" );
 
+	$cui->set_binding( \&mark_unread, "u" );
 	$cui->set_binding(sub {$menu->focus()}, "\cX");
 	$cui->set_binding( \&exit_dialog , "\cQ" );
 	$cui->set_binding( \&update_subscriptions, "\cR" );
@@ -144,9 +139,19 @@ sub set_menu() {
 	}, "o");
 }
 
-sub update_subscriptions() {
+sub mark_unread {
 
-	attempt_sync();
+	return unless defined $selected_story;
+
+	if ($selected_story ~~ @story_hashes) {
+		$cui->status($selected_story ~~ @story_hashes);
+	}
+
+}
+
+sub update_subscriptions {
+
+	attempt_sync("Updating subscriptions");
 
 	my %subscriptions = $nb->get_subscriptions();
 
@@ -155,7 +160,7 @@ sub update_subscriptions() {
 	$sub_list->draw();
 }
 
-sub set_window() {
+sub set_window {
 	$mainwindow = $cui->add( 'mainwindow', 'Window', -border => 1, -y    => 1, -bfg  => 'red' );
 
 	$sub_list = $mainwindow->add(
@@ -189,17 +194,23 @@ sub set_window() {
 	);
 }
 
-sub status() {
-	my ($status) = @_;
+sub status {
+	my ($status, $cb) = @_;
 
-	$cui->status($status . " ...");
+	$cui->status(
+		-message => $status . " ...",
+		-x => $sub_list_width,
+		-y => 0
+	);
+	&$cb;
+	$cui->nostatus();
 }
 
-sub sub_list() {
+sub sub_list {
 	return $sub_list;
 }
 
-sub exit_dialog() {
+sub exit_dialog {
 	my $return = $cui->dialog(
 		-message   => "Do you really want to quit?",
 		-title     => "Are you sure???", 
@@ -211,12 +222,14 @@ sub exit_dialog() {
 
 package Newsblur;
 
+use utf8;
 use JSON;
 use LWP::UserAgent;
+use Text::Unidecode;
 use URI;
 use URI::QueryParam;
 
-sub new() {
+sub new {
 	my ($class_name) = @_;
 	my ($self) = {};
 
@@ -226,14 +239,14 @@ sub new() {
 
 	my $ua = LWP::UserAgent->new();
 	$ua->cookie_jar({ file => "$ENV{HOME}/.cookies.txt", autosave => 1 });
-	$ua->timeout(10);
+	$ua->timeout(30);
 	$ua->env_proxy;
 	$self->{'ua'} = $ua;
 
 	return $self;
 }
 
-sub set_cui() {
+sub set_cui {
 	my ($self, $cui) = @_;
 
 	$self->{'cui'} = $cui;
@@ -241,33 +254,30 @@ sub set_cui() {
 	return $self;
 }
 
-sub get_subscriptions() {
+sub get_subscriptions {
 	my ($self) = @_;
 
 	if (! $self->is_logged_in()) {
 		$self->login();
 	}
 
-	$self->status("Getting feeds");
-	my $result = decode_json($self->get('/reader/feeds', { }));
-	$self->nostatus();
-
-	$self->status("Counting is hard");
-	my $counts = decode_json($self->get('/reader/refresh_feeds'));
-	$self->nostatus();
+	my $result;
+	$self->status("Getting feeds", sub {
+		$result = decode_json($self->get('/reader/feeds', { }));
+	});
 
 	my %subscriptions = ();
 	foreach my $feed_id (keys %{$result->{feeds}}) {
 		next unless
-			$counts->{feeds}{$feed_id}{nt} > 0 # neutral intelligence
-			|| $counts->{feeds}{$feed_id}{ps} > 0; # positive intelligence
+			$result->{feeds}{$feed_id}{nt} > 0 # neutral intelligence
+			|| $result->{feeds}{$feed_id}{ps} > 0; # positive intelligence
 		$subscriptions{$feed_id} = '<bold>' . $result->{feeds}{$feed_id}{feed_title} . '</bold>';
 	}
 	
 	return %subscriptions;
 }
 
-sub mark_as_read() {
+sub mark_as_read {
 	my ($self, $hashes) = @_;
 
 	my $result = decode_json($self->post('/reader/mark_story_hashes_as_read', { story_hash => $hashes }));
@@ -276,7 +286,7 @@ sub mark_as_read() {
 	return 0;
 }
 
-sub refresh_feeds() {
+sub refresh_feeds {
 	my ($self, $hashes) = @_;
 
 	my $result = decode_json($self->get('/reader/refresh_feeds'));
@@ -285,7 +295,7 @@ sub refresh_feeds() {
 	return 0;
 }
 
-sub get_stories() {
+sub get_stories {
 	my ($self, $feed_id) = @_;
 
 	return unless $feed_id;
@@ -294,9 +304,10 @@ sub get_stories() {
 		$self->login();
 	}
 
-	$self->status("Getting stories for feed");
-	my $result = decode_json($self->get('/reader/feed/' . $feed_id, { read_filter => 'unread' }));
-	$self->nostatus();
+	my $result;
+	$self->status("Getting stories for feed", sub {
+		$result = decode_json($self->get('/reader/feed/' . $feed_id, { read_filter => 'unread' }));
+	});
 
 	my %stories = ();
 	foreach my $story (@{$result->{stories}}) {
@@ -309,7 +320,7 @@ sub get_stories() {
 	
 	return %stories;
 }
-sub get() {
+sub get {
 	my ($self, $endpoint, $parameters) = @_;
 
 	my $ua = $self->{ua};
@@ -325,7 +336,7 @@ sub get() {
 	
 	return $response->content();
 }
-sub post() {
+sub post {
 	my ($self, $endpoint, $parameters) = @_;
 
 	my $ua = $self->{ua};
@@ -340,7 +351,7 @@ sub post() {
 	return $response->content();
 }
 
-sub is_logged_in() {
+sub is_logged_in {
 	my ($self) = @_;
 
 	if (! $self->{_logged_in}) {
@@ -355,7 +366,7 @@ sub is_logged_in() {
 	return 0;
 }
 
-sub login() {
+sub login {
 	my ($self) = @_;
 
 	my $username = $self->{cui}->question("What is your Newsblur.com username?");
@@ -370,32 +381,35 @@ sub login() {
     $self->{cui}->delete($id);
     $self->{cui}->root->focus(undef, 1);
 
-	$self->status("Attempting to log in");
-	my $result = decode_json($self->post('/api/login', { username => $username, password => $password }));
-	$self->nostatus();
+	my $result;
+	$self->status("Attempting to log in", sub {
+		$result = decode_json($self->post('/api/login', { username => $username, password => $password }));
+	});
 
 	if ($result->{errors}) {
 		$self->error($result->{errors});
 	}
 
-	$self->status("Logged in successfully!");
-	$self->{_logged_in} = 1;
-	$self->nostatus();
+	$self->status("Logged in successfully!", sub {
+		$self->{_logged_in} = 1;
+	});
 }
 
-sub status() {
-	my ($self, $status) = @_;
+sub status {
+	my ($self, $status, $cb) = @_;
 
 	$self->{cui}->status($status . " ...");
+	&$cb;
+	$self->{cui}->nostatus();
 }
 
-sub nostatus() {
+sub nostatus {
 	my ($self) = @_;
 
 	$self->{cui}->nostatus();
 }
 
-sub error() {
+sub error {
 	my ($self, $content) = @_;
 
 	$self->{cui}->error(
